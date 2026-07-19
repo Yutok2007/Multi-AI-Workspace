@@ -1,0 +1,314 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+
+import { useI18n } from '../shared/i18n/I18nContext';
+import { promptRecordSchema } from '../shared/schemas/records';
+import { WorkspaceDatabase } from '../shared/storage/indexedDb';
+import type { PromptRecord } from '../shared/types/records';
+
+const database = new WorkspaceDatabase();
+
+interface PromptForm {
+  id?: string;
+  title: string;
+  content: string;
+  description: string;
+  tags: string;
+  favorite: boolean;
+}
+
+const EMPTY_FORM: PromptForm = {
+  title: '',
+  content: '',
+  description: '',
+  tags: '',
+  favorite: false,
+};
+
+const currentTimestamp = () => Date.now();
+
+function download(filename: string, content: string): void {
+  const url = URL.createObjectURL(new Blob([content], { type: 'application/json' }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+export function PromptManager() {
+  const t = useI18n();
+  const [prompts, setPrompts] = useState<PromptRecord[]>([]);
+  const [form, setForm] = useState<PromptForm>(EMPTY_FORM);
+  const [query, setQuery] = useState('');
+  const [notice, setNotice] = useState('');
+  const [error, setError] = useState('');
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  const load = async () => {
+    const records = await database.getAll('prompts');
+    setPrompts(
+      records.sort((a, b) => Number(b.favorite) - Number(a.favorite) || b.updatedAt - a.updatedAt),
+    );
+  };
+
+  useEffect(() => {
+    let active = true;
+    void database.getAll('prompts').then((records) => {
+      if (active) {
+        setPrompts(
+          records.sort(
+            (a, b) => Number(b.favorite) - Number(a.favorite) || b.updatedAt - a.updatedAt,
+          ),
+        );
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const visible = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase();
+    if (!needle) return prompts;
+    return prompts.filter((prompt) =>
+      [prompt.title, prompt.content, prompt.description, ...prompt.tags]
+        .join('\n')
+        .toLocaleLowerCase()
+        .includes(needle),
+    );
+  }, [prompts, query]);
+
+  const save = async () => {
+    if (!form.title.trim() || !form.content.trim()) {
+      setError(t('promptRequiredFields'));
+      return;
+    }
+    const now = Date.now();
+    const existing = form.id ? await database.get('prompts', form.id) : undefined;
+    const record: PromptRecord = {
+      id: form.id ?? crypto.randomUUID(),
+      scope: existing?.scope ?? 'global',
+      platformId: existing?.platformId ?? null,
+      accountScopeId: existing?.accountScopeId ?? null,
+      title: form.title.trim(),
+      content: form.content,
+      description: form.description.trim(),
+      tags: [
+        ...new Set(
+          form.tags
+            .split(',')
+            .map((tag) => tag.trim())
+            .filter(Boolean),
+        ),
+      ],
+      folderId: existing?.folderId ?? null,
+      usageCount: existing?.usageCount ?? 0,
+      favorite: form.favorite,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    await database.put('prompts', record);
+    setForm(EMPTY_FORM);
+    setError('');
+    setNotice(t('promptSaved'));
+    await load();
+  };
+
+  const edit = (prompt: PromptRecord) =>
+    setForm({
+      id: prompt.id,
+      title: prompt.title,
+      content: prompt.content,
+      description: prompt.description,
+      tags: prompt.tags.join(', '),
+      favorite: prompt.favorite,
+    });
+
+  const remove = async (id: string) => {
+    if (!confirm(t('promptDeleteConfirm'))) return;
+    await database.delete('prompts', id);
+    if (form.id === id) setForm(EMPTY_FORM);
+    await load();
+  };
+
+  const toggleFavorite = async (prompt: PromptRecord) => {
+    await database.put('prompts', {
+      ...prompt,
+      favorite: !prompt.favorite,
+      updatedAt: currentTimestamp(),
+    });
+    await load();
+  };
+
+  const importPrompts = async (file: File) => {
+    try {
+      const parsed: unknown = JSON.parse(await file.text());
+      if (!Array.isArray(parsed)) throw new Error(t('promptImportInvalid'));
+      const validated = parsed.map((entry) => promptRecordSchema.safeParse(entry));
+      if (validated.some((result) => !result.success)) throw new Error(t('promptImportInvalid'));
+      const records = validated.flatMap((result) => (result.success ? [result.data] : []));
+      for (const record of records) {
+        const existing = await database.get('prompts', record.id);
+        await database.put('prompts', {
+          ...record,
+          createdAt: existing?.createdAt ?? record.createdAt ?? Date.now(),
+          updatedAt: Date.now(),
+          tags: Array.isArray(record.tags)
+            ? record.tags.filter((tag) => typeof tag === 'string')
+            : [],
+        });
+      }
+      await load();
+      setNotice(t('promptImportComplete', { count: records.length }));
+      setError('');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : t('promptImportInvalid'));
+    }
+  };
+
+  return (
+    <div className="settings-stack">
+      {notice ? <div className="notice">{notice}</div> : null}
+      {error ? <div className="notice notice-error">{error}</div> : null}
+      <article className="setting-card workspace-card">
+        <h2>{form.id ? t('editPrompt') : t('newPrompt')}</h2>
+        <p className="setting-description">{t('promptVariablesHelp')}</p>
+        <div className="form-grid two-columns">
+          <label>
+            <span>{t('promptTitle')}</span>
+            <input
+              value={form.title}
+              onChange={(event) => setForm({ ...form, title: event.target.value })}
+            />
+          </label>
+          <label>
+            <span>{t('promptTags')}</span>
+            <input
+              value={form.tags}
+              onChange={(event) => setForm({ ...form, tags: event.target.value })}
+            />
+          </label>
+          <label className="wide-field">
+            <span>{t('promptDescription')}</span>
+            <input
+              value={form.description}
+              onChange={(event) => setForm({ ...form, description: event.target.value })}
+            />
+          </label>
+          <label className="wide-field">
+            <span>{t('promptContent')}</span>
+            <textarea
+              rows={9}
+              value={form.content}
+              onChange={(event) => setForm({ ...form, content: event.target.value })}
+            />
+          </label>
+          <label className="check-label">
+            <input
+              type="checkbox"
+              checked={form.favorite}
+              onChange={(event) => setForm({ ...form, favorite: event.target.checked })}
+            />
+            <span>{t('favorite')}</span>
+          </label>
+        </div>
+        <div className="button-row">
+          <button className="button button-primary" type="button" onClick={() => void save()}>
+            {t('savePrompt')}
+          </button>
+          {form.id ? (
+            <button
+              className="button button-secondary"
+              type="button"
+              onClick={() => setForm(EMPTY_FORM)}
+            >
+              {t('cancel')}
+            </button>
+          ) : null}
+        </div>
+      </article>
+      <article className="setting-card action-card prompt-tools">
+        <input
+          className="search-input"
+          type="search"
+          placeholder={t('searchPrompts')}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+        />
+        <div className="button-row">
+          <button
+            className="button button-secondary"
+            type="button"
+            onClick={() =>
+              download('multi-ai-prompts.json', `${JSON.stringify(prompts, null, 2)}\n`)
+            }
+          >
+            {t('exportPrompts')}
+          </button>
+          <button
+            className="button button-secondary"
+            type="button"
+            onClick={() => fileInput.current?.click()}
+          >
+            {t('importPrompts')}
+          </button>
+          <input
+            ref={fileInput}
+            hidden
+            type="file"
+            accept="application/json,.json"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void importPrompts(file);
+              event.target.value = '';
+            }}
+          />
+        </div>
+      </article>
+      <div className="card-grid">
+        {visible.map((prompt) => (
+          <article className="setting-card compact-card" key={prompt.id}>
+            <div className="profile-heading">
+              <h2>{prompt.title}</h2>
+              <button
+                className="favorite-button"
+                type="button"
+                aria-label={t('favorite')}
+                onClick={() => void toggleFavorite(prompt)}
+              >
+                {prompt.favorite ? '★' : '☆'}
+              </button>
+            </div>
+            {prompt.description ? <p className="muted">{prompt.description}</p> : null}
+            <pre className="prompt-preview">{prompt.content}</pre>
+            <div className="tag-row">
+              {prompt.tags.map((tag) => (
+                <span key={tag}>{tag}</span>
+              ))}
+            </div>
+            <div className="button-row">
+              <button className="text-button" type="button" onClick={() => edit(prompt)}>
+                {t('edit')}
+              </button>
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => void navigator.clipboard.writeText(prompt.content)}
+              >
+                {t('copy')}
+              </button>
+              <button
+                className="text-button danger-text"
+                type="button"
+                onClick={() => void remove(prompt.id)}
+              >
+                {t('delete')}
+              </button>
+            </div>
+          </article>
+        ))}
+      </div>
+      {visible.length === 0 ? <div className="empty-state">{t('noPrompts')}</div> : null}
+    </div>
+  );
+}
